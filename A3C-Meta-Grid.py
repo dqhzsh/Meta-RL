@@ -143,135 +143,147 @@ class AC_Network():
 
 # ### Worker Agent
 class Worker():
-    def __init__(self,game,name,a_size,trainer,model_path,global_episodes):
-        self.name = "worker_" + str(name)
-        self.number = name        
-        self.model_path = model_path
-        self.trainer = trainer
-        self.global_episodes = global_episodes
-        self.increment = self.global_episodes.assign_add(1)
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.episode_mean_values = []
-        self.summary_writer = tf.summary.FileWriter("train_"+str(self.number))
+    def __init__(self, game, name, a_size, trainer, model_path, global_episodes):
+        # 初始化Worker对象
+        # game: 游戏环境
+        # name: 工作器的名称
+        # a_size: 动作空间的大小
+        # trainer: 用于更新参数的优化器
+        # model_path: 模型保存路径
+        # global_episodes: 全局的训练轮数
+        self.name = "worker_" + str(name)  # 设置工作器的名称
+        self.number = name  # 设置工作器的编号
+        self.model_path = model_path  # 设置模型保存路径
+        self.trainer = trainer  # 设置优化器
+        self.global_episodes = global_episodes  # 设置全局的训练轮数
+        self.increment = self.global_episodes.assign_add(1)  # 每次增加全局的训练轮数
+        self.episode_rewards = []  # 记录每个回合的奖励
+        self.episode_lengths = []  # 记录每个回合的步数
+        self.episode_mean_values = []  # 记录每个回合的状态值的均值
+        self.summary_writer = tf.summary.FileWriter("train_"+str(self.number))  # 用于记录训练日志的写入器
 
-        #Create the local copy of the network and the tensorflow op to copy global paramters to local network
-        self.local_AC = AC_Network(a_size,self.name,trainer)
-        self.update_local_ops = update_target_graph('global',self.name)        
-        self.env = game
-        
-    def train(self,rollout,sess,gamma,bootstrap_value):
-        rollout = np.array(rollout)
-        states = rollout[:,0]
-        actions = rollout[:,1]
-        rewards = rollout[:,2]
-        timesteps = rollout[:,3]
-        prev_rewards = [0] + rewards[:-1].tolist()
-        prev_actions = [0] + actions[:-1].tolist()
-        values = rollout[:,5]
-        
-        self.pr = prev_rewards
-        self.pa = prev_actions
-        # Here we take the rewards and values from the rollout, and use them to 
-        # generate the advantage and discounted returns. 
-        # The advantage function uses "Generalized Advantage Estimation"
+        # 创建本地网络的副本以及将全局参数复制到本地网络的操作
+        self.local_AC = AC_Network(a_size, self.name, trainer)  # 创建本地AC网络
+        self.update_local_ops = update_target_graph('global', self.name)  # 创建操作，将全局参数复制到本地网络
+        self.env = game  # 设置游戏环境
+
+    def train(self, rollout, sess, gamma, bootstrap_value):
+        # 对网络进行训练
+        # rollout: 回合数据
+        # sess: TensorFlow会话
+        # gamma: 折扣因子
+        # bootstrap_value: 用于计算优势的引导值
+        rollout = np.array(rollout)  # 将回合数据转换为NumPy数组
+        states = rollout[:, 0]  # 状态序列
+        actions = rollout[:, 1]  # 动作序列
+        rewards = rollout[:, 2]  # 奖励序列
+        timesteps = rollout[:, 3]  # 时间步序列
+        prev_rewards = [0] + rewards[:-1].tolist()  # 前一个时间步的奖励
+        prev_actions = [0] + actions[:-1].tolist()  # 前一个时间步的动作
+        values = rollout[:, 5]  # 状态值
+
+        # 计算回报和优势
         self.rewards_plus = np.asarray(rewards.tolist() + [bootstrap_value])
-        discounted_rewards = discount(self.rewards_plus,gamma)[:-1]
+        discounted_rewards = discount(self.rewards_plus, gamma)[:-1]
         self.value_plus = np.asarray(values.tolist() + [bootstrap_value])
         advantages = rewards + gamma * self.value_plus[1:] - self.value_plus[:-1]
-        advantages = discount(advantages,gamma)
+        advantages = discount(advantages, gamma)
 
-        # Update the global network using gradients from loss
-        # Generate network statistics to periodically save
+        # 更新全局网络的参数
         rnn_state = self.local_AC.state_init
-        feed_dict = {self.local_AC.target_v:discounted_rewards,
-            self.local_AC.state:np.stack(states,axis=0),
-            self.local_AC.prev_rewards:np.vstack(prev_rewards),
-            self.local_AC.prev_actions:prev_actions,
-            self.local_AC.actions:actions,
-            self.local_AC.timestep:np.vstack(timesteps),
-            self.local_AC.advantages:advantages,
-            self.local_AC.state_in[0]:rnn_state[0],
-            self.local_AC.state_in[1]:rnn_state[1]}
-        v_l,p_l,e_l,g_n,v_n,_ = sess.run([self.local_AC.value_loss,
-            self.local_AC.policy_loss,
-            self.local_AC.entropy,
-            self.local_AC.grad_norms,
-            self.local_AC.var_norms,
-            self.local_AC.apply_grads],
-            feed_dict=feed_dict)
-        return v_l / len(rollout),p_l / len(rollout),e_l / len(rollout), g_n,v_n
-        
-    def work(self,gamma,sess,coord,saver,train):
-        episode_count = sess.run(self.global_episodes)
-        total_steps = 0
-        print "Starting worker " + str(self.number)
-        with sess.as_default(), sess.graph.as_default():                 
-            while not coord.should_stop():
-                sess.run(self.update_local_ops)
-                episode_buffer = []
-                episode_values = []
-                episode_frames = []
-                episode_reward = 0
-                episode_step_count = 0
-                d = False
-                r = 0
-                a = 0
-                t = 0
-                reward_color = [np.random.uniform(),np.random.uniform(),np.random.uniform()]
-                #reward_color = [1,0,0]
-                s,s_big = self.env.reset(reward_color)
-                rnn_state = self.local_AC.state_init
-                
-                while d == False:
-                    #Take an action using probabilities from policy network output.
-                    a_dist,v,rnn_state_new = sess.run([self.local_AC.policy,self.local_AC.value,self.local_AC.state_out], 
-                        feed_dict={
-                        self.local_AC.state:[s],
-                        self.local_AC.prev_rewards:[[r]],
-                        self.local_AC.timestep:[[t]],
-                        self.local_AC.prev_actions:[a],
-                        self.local_AC.state_in[0]:rnn_state[0],
-                        self.local_AC.state_in[1]:rnn_state[1]})
-                    a = np.random.choice(a_dist[0],p=a_dist[0])
-                    a = np.argmax(a_dist == a)
-                    
-                    rnn_state = rnn_state_new
-                    s1,s1_big,r,d,_,_ = self.env.step(a)                        
-                    episode_buffer.append([s,a,r,t,d,v[0,0]])
-                    episode_values.append(v[0,0])
+        feed_dict = {
+            self.local_AC.target_v: discounted_rewards,
+            self.local_AC.state: np.stack(states, axis=0),
+            self.local_AC.prev_rewards: np.vstack(prev_rewards),
+            self.local_AC.prev_actions: prev_actions,
+            self.local_AC.actions: actions,
+            self.local_AC.timestep: np.vstack(timesteps),
+            self.local_AC.advantages: advantages,
+            self.local_AC.state_in[0]: rnn_state[0],
+            self.local_AC.state_in[1]: rnn_state[1]
+        }
+        v_l, p_l, e_l, g_n, v_n, _ = sess.run([self.local_AC.value_loss,
+                                                self.local_AC.policy_loss,
+                                                self.local_AC.entropy,
+                                                self.local_AC.grad_norms,
+                                                self.local_AC.var_norms,
+                                                self.local_AC.apply_grads],
+                                               feed_dict=feed_dict)
+        return v_l / len(rollout), p_l / len(rollout), e_l / len(rollout), g_n, v_n
+
+    def work(self, gamma, sess, coord, saver, train):
+        # 工作函数，用于执行训练
+        episode_count = sess.run(self.global_episodes)  # 获取当前的全局训练轮数
+        total_steps = 0  # 总步数
+        print("Starting worker " + str(self.number))  # 打印工作器开始工作
+        with sess.as_default(), sess.graph.as_default():  # 设置默认的会话和图
+            while not coord.should_stop():  # 当协调器未停止时
+                sess.run(self.update_local_ops)  # 更新本地网络参数
+                episode_buffer = []  # 初始化回合缓存
+                episode_values = []  # 初始化回合的状态值
+                episode_frames = []  # 初始化回合的帧
+                episode_reward = 0  # 初始化回合奖励
+                episode_step_count = 0  # 初始化回合步数
+                d = False  # 初始化回合结束标志
+                r = 0  # 初始化当前时间步的奖励
+                a = 0  # 初始化动作
+                t = 0  # 初始化时间步
+                reward_color = [np.random.uniform(), np.random.uniform(), np.random.uniform()]  # 随机生成奖励颜色
+                # reward_color = [1,0,0]
+                s, s_big = self.env.reset(reward_color)  # 重置游戏环境并获取初始状态
+                rnn_state = self.local_AC.state_init  # 初始化RNN状态
+
+                while not d:  # 当回合未结束时
+                    # 使用策略网络输出的概率采样动作
+                    a_dist, v, rnn_state_new = sess.run([self.local_AC.policy, self.local_AC.value, self.local_AC.state_out],
+                                                         feed_dict={
+                                                             self.local_AC.state: [s],
+                                                             self.local_AC.prev_rewards: [[r]],
+                                                             self.local_AC.timestep: [[t]],
+                                                             self.local_AC.prev_actions: [a],
+                                                             self.local_AC.state_in[0]: rnn_state[0],
+                                                             self.local_AC.state_in[1]: rnn_state[1]})
+                    a = np.random.choice(a_dist[0], p=a_dist[0])  # 根据概率选择动作
+                    a = np.argmax(a_dist == a)  # 获取动作索引
+
+                    rnn_state = rnn_state_new  # 更新RNN状态
+                    s1, s1_big, r, d, _, _ = self.env.step(a)  # 执行动作，获取下一个状态、奖励等信息
+
+                    # 记录回合数据
+                    episode_buffer.append([s, a, r, t, d, v[0, 0]])
+                    episode_values.append(v[0, 0])
                     episode_reward += r
-                    episode_frames.append(set_image_gridworld(s1_big,reward_color,episode_reward,t))
+                    episode_frames.append(set_image_gridworld(s1_big, reward_color, episode_reward, t))  # 将当前状态的图像添加到回合帧列表中
                     total_steps += 1
                     t += 1
                     episode_step_count += 1
-                    s = s1
-                    
-                    if episode_step_count > 100:
+                    s = s1  # 更新状态
+
+                    if episode_step_count > 100:  # 如果回合步数超过100步，则结束回合
                         d = True
-                                            
+
+                # 记录回合奖励、步数和状态值
                 self.episode_rewards.append(episode_reward)
                 self.episode_lengths.append(episode_step_count)
                 self.episode_mean_values.append(np.mean(episode_values))
-                
-                # Update the network using the experience buffer at the end of the episode.
-                if len(episode_buffer) != 0 and train == True:
-                    v_l,p_l,e_l,g_n,v_n = self.train(episode_buffer,sess,gamma,0.0)
-            
-                    
-                # Periodically save gifs of episodes, model parameters, and summary statistics.
+
+                # 使用回合数据训练网络
+                if len(episode_buffer) != 0 and train:
+                    v_l, p_l, e_l, g_n, v_n = self.train(episode_buffer, sess, gamma, 0.0)
+
+                # 每隔一定回合数保存模型、生成gif动画和记录日志
                 if episode_count % 50 == 0 and episode_count != 0:
-                    if episode_count % 500 == 0 and self.name == 'worker_0' and train == True:
-                        saver.save(sess,self.model_path+'/model-'+str(episode_count)+'.cptk')
-                        print "Saved Model"
+                    if episode_count % 500 == 0 and self.name == 'worker_0' and train:
+                        saver.save(sess, self.model_path+'/model-'+str(episode_count)+'.cptk')
+                        print("Saved Model")
 
                     if self.name == 'worker_0' and episode_count % 50 == 0:
                         time_per_step = 0.25
                         self.images = np.array(episode_frames)
-                        make_gif(self.images,'./frames/image'+str(episode_count)+'.gif',
-                            duration=len(self.images)*time_per_step,true_image=True)
+                        make_gif(self.images, './frames/image'+str(episode_count)+'.gif',
+                                 duration=len(self.images)*time_per_step, true_image=True)
 
-                        
+                    # 计算近50个回合的奖励、步数和状态值的均值，并记录到日志中
                     mean_reward = np.mean(self.episode_rewards[-50:])
                     mean_length = np.mean(self.episode_lengths[-50:])
                     mean_value = np.mean(self.episode_mean_values[-50:])
@@ -279,7 +291,7 @@ class Worker():
                     summary.value.add(tag='Perf/Reward', simple_value=float(mean_reward))
                     summary.value.add(tag='Perf/Length', simple_value=float(mean_length))
                     summary.value.add(tag='Perf/Value', simple_value=float(mean_value))
-                    if train == True:
+                    if train:
                         summary.value.add(tag='Losses/Value Loss', simple_value=float(v_l))
                         summary.value.add(tag='Losses/Policy Loss', simple_value=float(p_l))
                         summary.value.add(tag='Losses/Entropy', simple_value=float(e_l))
@@ -288,55 +300,73 @@ class Worker():
                     self.summary_writer.add_summary(summary, episode_count)
 
                     self.summary_writer.flush()
+
                 if self.name == 'worker_0':
-                    sess.run(self.increment)
-                episode_count += 1
+                    sess.run(self.increment)  # 增加全局训练轮数
+                episode_count += 1  # 增加当前回合数
 
 
+gamma = .95  # 折扣率，用于优势估计和折扣奖励
+a_size = 4  # 动作空间的大小
+load_model = True  # 是否加载已有模型
+train = False  # 是否进行训练
+model_path = './model_meta_grid'  # 模型保存路径
 
-
-gamma = .95 # discount rate for advantage estimation and reward discounting
-a_size = 4 
-load_model = True
-train = False
-model_path = './model_meta_grid'
-
-
-
-
+# 重置 TensorFlow 默认图
 tf.reset_default_graph()
 
+# 如果模型保存路径不存在，则创建该路径
 if not os.path.exists(model_path):
     os.makedirs(model_path)
-    
+
+# 如果 './frames' 路径不存在，则创建该路径
 if not os.path.exists('./frames'):
     os.makedirs('./frames')
-    
-with tf.device("/cpu:0"): 
-    global_episodes = tf.Variable(0,dtype=tf.int32,name='global_episodes',trainable=False)
+
+# 将全局回合数数设定为不可训练的整数型变量，并将其初始化为 0
+with tf.device("/cpu:0"):
+    global_episodes = tf.Variable(0, dtype=tf.int32, name='global_episodes', trainable=False)
+    # 使用 Adam 优化器
     trainer = tf.train.AdamOptimizer(learning_rate=1e-3)
-    master_network = AC_Network(a_size,'global',None) # Generate global network
-    num_workers = multiprocessing.cpu_count() # Set workers ot number of available CPU threads
-    workers = []
-    # Create worker classes
+    # 创建全局网络
+    master_network = AC_Network(a_size, 'global', None)
+    # 设置工作进程数量为可用 CPU 线程数
+    num_workers = multiprocessing.cpu_count()  # 获取可用的 CPU 核心数
+    workers = []  # 创建一个空列表，用于存储 Worker 类的实例对象
+
+    # 循环创建多个工作类实例
     for i in range(num_workers):
-        workers.append(Worker(gameEnv(partial=False,size=5,goal_color=[np.random.uniform(),np.random.uniform(),np.random.uniform()]),i,a_size,trainer,model_path,global_episodes))
-    saver = tf.train.Saver(max_to_keep=5)
+        # 创建 Worker 类的实例，并将其添加到 workers 列表中
+        # gameEnv(partial=False, size=5, goal_color=[np.random.uniform(), np.random.uniform(), np.random.uniform()]) 用于创建游戏环境实例
+        # i 是工作线程的编号
+        # a_size 是动作空间的大小
+        # trainer 是用于优化的训练器实例
+        # model_path 是模型保存路径
+        # global_episodes 是全局剧集数
+        workers.append(Worker(
+            gameEnv(partial=False, size=5, goal_color=[np.random.uniform(), np.random.uniform(), np.random.uniform()]),
+            i, a_size, trainer, model_path, global_episodes))
+
+    saver = tf.train.Saver(max_to_keep=5)  # 创建一个 Saver 实例，用于保存模型
 
 with tf.Session() as sess:
-    coord = tf.train.Coordinator()
-    if load_model == True:
-        print 'Loading Model...'
-        ckpt = tf.train.get_checkpoint_state(model_path)
-        saver.restore(sess,ckpt.model_checkpoint_path)
+    coord = tf.train.Coordinator()  # 创建一个 Coordinator 实例，用于协调多个线程
+    if load_model == True:  # 如果设置了 load_model 为 True，则加载模型
+        print('Loading Model...')  # 输出提示信息，表示正在加载模型
+        ckpt = tf.train.get_checkpoint_state(model_path)  # 获取模型检查点状态
+        saver.restore(sess, ckpt.model_checkpoint_path)  # 恢复模型参数
     else:
-        sess.run(tf.global_variables_initializer())
-        
-    worker_threads = []
+        sess.run(tf.global_variables_initializer())  # 否则，初始化所有模型参数
+
+    worker_threads = []  # 创建一个空列表，用于存储工作线程
     for worker in workers:
-        worker_work = lambda: worker.work(gamma,sess,coord,saver,train)
-        thread = threading.Thread(target=(worker_work))
-        thread.start()
-        worker_threads.append(thread)
-    coord.join(worker_threads)
+        # 启动工作线程
+        worker_work = lambda: worker.work(gamma, sess, coord, saver, train)  # 创建一个 lambda 函数，用于调用 Worker 类的 work 方法
+        thread = threading.Thread(target=(worker_work))  # 创建一个线程对象，目标函数为 worker_work
+        thread.start()  # 启动线程
+        worker_threads.append(thread)  # 将线程对象添加到 worker_threads 列表中
+
+    coord.join(worker_threads)  # 等待所有工作线程结束，防止主线程提前结束
+
+
 
